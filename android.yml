@@ -1,0 +1,93 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'CapyMS_1.26_optimized.zip'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GODOT_VERSION: '4.7.2'
+      GODOT_ANDROID_KEYSTORE_DEBUG_PATH: /home/runner/.android/debug.keystore
+      GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+      GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        run: sdkmanager "platform-tools" "build-tools;35.0.1" "platforms;android-35"
+      - name: Restore debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: capyms-debug-signing-v1
+      - name: Prepare signing key
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$GODOT_ANDROID_KEYSTORE_DEBUG_PATH" ]; then
+            keytool -genkeypair -keystore "$GODOT_ANDROID_KEYSTORE_DEBUG_PATH" -storepass android -keypass android -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
+          fi
+      - name: Install Godot and matching export templates
+        shell: python
+        run: |
+          import os, pathlib, urllib.request, zipfile
+          version = os.environ['GODOT_VERSION']
+          base = 'https://github.com/godotengine/godot-builds/releases/download/' + version + '-stable/'
+          editor = f'Godot_v{version}-stable_linux.x86_64'
+          urllib.request.urlretrieve(base + editor + '.zip', '/tmp/godot.zip')
+          urllib.request.urlretrieve(base + f'Godot_v{version}-stable_export_templates.tpz', '/tmp/templates.tpz')
+          tools = pathlib.Path.home() / 'godot-tools'
+          tools.mkdir(exist_ok=True)
+          with zipfile.ZipFile('/tmp/godot.zip') as z:
+              z.extractall(tools)
+          binary = tools / editor
+          binary.chmod(0o755)
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'GODOT_BIN={binary}\n')
+          target = pathlib.Path.home() / '.local/share/godot/export_templates' / f'{version}.stable'
+          target.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile('/tmp/templates.tpz') as z:
+              for name in ['android_debug.apk', 'android_release.apk', 'android_source.zip']:
+                  (target / name).write_bytes(z.read('templates/' + name))
+      - name: Unpack project and configure export paths
+        shell: python
+        run: |
+          import os, pathlib, zipfile
+          with zipfile.ZipFile('CapyMS_1.26_optimized.zip') as z:
+              z.extractall('project')
+          cfg = pathlib.Path.home() / '.config/godot'
+          cfg.mkdir(parents=True, exist_ok=True)
+          java = os.environ['JAVA_HOME']
+          android = os.environ.get('ANDROID_HOME') or os.environ['ANDROID_SDK_ROOT']
+          settings = '[gd_resource type="EditorSettings" format=3]\n\n[resource]\nexport/android/java_sdk_path = "' + java + '"\nexport/android/android_sdk_path = "' + android + '"\n'
+          for name in ['editor_settings-4.tres', 'editor_settings-4.7.tres']:
+              (cfg / name).write_text(settings)
+          pathlib.Path('build').mkdir(exist_ok=True)
+      - name: Import project (no display or Vulkan needed)
+        run: '"$GODOT_BIN" --headless --path project/CapyMS_1.26 --editor --import'
+      - name: Export installable debug APK
+        shell: bash
+        run: |
+          "$GODOT_BIN" --headless --path project/CapyMS_1.26 --export-debug Android "$GITHUB_WORKSPACE/build/CapyMS.apk"
+          test -s build/CapyMS.apk
+          "$ANDROID_HOME/build-tools/35.0.1/apksigner" verify build/CapyMS.apk
+      - name: Download APK here
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapyMS-APK
+          path: build/CapyMS.apk
+          if-no-files-found: error
+          retention-days: 7
